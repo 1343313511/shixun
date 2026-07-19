@@ -114,6 +114,46 @@ if not username or not password:
 
 ---
 
+### 🚨 Bug 6：垂直越权（Vertical Privilege Escalation）
+
+**严重级别：** 严重
+**涉及文件：** `app.py` – 所有路由
+
+**问题描述：**  
+系统设计了 `admin`（管理员）和 `user`（普通用户）两个角色，但代码中没有任何权限校验机制。如果后续增加管理员专属接口（如用户管理、数据面板），普通用户可以直接越权访问。即使当前只有一个首页路由，这种架构缺陷也为后续扩展埋下了严重安全隐患。
+
+**修复方案：**  
+新增 `login_required()` 装饰器，支持角色白名单控制：
+
+```python
+def login_required(roles=None):
+    """
+    登录验证 + 角色权限控制装饰器
+    使用方式：
+        @login_required()                # 仅需登录
+        @login_required(roles=["admin"])  # 仅管理员可访问
+    """
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            username = session.get("username")
+            if not username:
+                return redirect(url_for("login"))
+            if roles and username in USERS:
+                user_role = USERS[username].get("role", "user")
+                if user_role not in roles:
+                    abort(403)
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+```
+
+使用方式：
+- `@login_required()` → 任意登录用户均可访问
+- `@login_required(roles=["admin"])` → 仅管理员可访问，普通用户返回 403
+
+---
+
 ### 🔸 其他改进
 
 | 项目 | 说明 |

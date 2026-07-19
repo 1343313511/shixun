@@ -1,5 +1,6 @@
-from flask import Flask, render_template, request, redirect, session, url_for
+from flask import Flask, render_template, request, redirect, session, url_for, abort
 from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
 import secrets
 
 app = Flask(__name__)
@@ -38,6 +39,28 @@ def get_user_info(username):
     return None
 
 
+def login_required(roles=None):
+    """
+    登录验证 + 角色权限控制装饰器
+    使用方式：
+        @login_required()           # 仅需登录
+        @login_required(roles=["admin"])  # 仅管理员可访问
+    """
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            username = session.get("username")
+            if not username:
+                return redirect(url_for("login"))
+            if roles and username in USERS:
+                user_role = USERS[username].get("role", "user")
+                if user_role not in roles:
+                    abort(403)  # 无权限
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+
 def verify_login(username, password):
     """
     验证用户名密码，使用恒定时间比较防止时序攻击。
@@ -54,6 +77,7 @@ def verify_login(username, password):
 
 
 @app.route("/")
+@login_required()
 def index():
     username = session.get("username")
     user = get_user_info(username)
