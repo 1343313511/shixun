@@ -90,8 +90,9 @@ def get_user_info(username):
 - `app.secret_key` 硬编码为固定值 `"dev-key-2025"`
 
 **修复方案：**
-1. 新增 `get_user_info()` 函数确保不暴露密码
-2. 代码中加入 `TODO` 注释提示生产环境应使用环境变量和密码哈希（如 `werkzeug.security`）
+1. **密码哈希存储** — 使用 `werkzeug.security.generate_password_hash()` 对密码进行 scrypt 哈希处理后存储，数据库/字典中不再存明文
+2. **恒定时间比较** — 新增 `verify_login()` 函数，内部使用 `check_password_hash()` 验证密码。用户名不存在时也对空哈希做一次 `check_password_hash`，保证每次登录响应时间一致，从根本上防御时序攻击（timing attack）
+3. **随机 secret_key** — 使用 `secrets.token_hex(32)` 生成密钥，替代硬编码固定值
 
 ---
 
@@ -121,6 +122,7 @@ if not username or not password:
 | 增加 `.strip()` | 对用户名做首尾空白处理 |
 | 代码注释 | 增加 `TODO` 标记，提示生产环境改进方向 |
 | 安全函数封装 | `get_user_info()` 统一管理用户数据暴露范围 |
+| 时序攻击防护 | `verify_login()` 即使用户名不存在也执行哈希计算，响应时间恒定 |
 
 ---
 
@@ -151,6 +153,8 @@ python app.py
 - 首页不应显示密码字段
 - 查看登录页页面源码，不应看到管理员凭证注释
 - 提交空表单应有错误提示
+- 验证密码哈希：登录正确/错误用户，响应时间无明显差异（时序攻击防护）
+- 验证 secret_key：每次 Flask 重启 session 要重新登录（因为密钥随机生成）
 
 ---
 
