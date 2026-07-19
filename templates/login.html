@@ -15,6 +15,19 @@
             <label for="password">密码</label>
             <input type="password" id="password" name="password" placeholder="请输入密码" required>
         </div>
+        {% if captcha_required %}
+        <div class="form-group captcha-group">
+            <label for="captcha">验证码</label>
+            <div class="captcha-row">
+                {% if captcha_img %}
+                    <img src="data:image/png;base64,{{ captcha_img }}" alt="验证码" class="captcha-img">
+                {% else %}
+                    <span class="captcha-fallback">请输入验证码</span>
+                {% endif %}
+            </div>
+            <input type="text" id="captcha" name="captcha" placeholder="请输入验证码" maxlength="4" required>
+        </div>
+        {% endif %}
         <button type="submit" class="btn btn-primary">登录</button>
     </form>
 </div>

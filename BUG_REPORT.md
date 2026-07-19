@@ -9,7 +9,7 @@
 ## 概述
 
 本项目是一个基于 Flask 的简单用户管理系统，包含登录、首页展示和登出功能。  
-代码审查发现 **3 个严重级别** 和 **2 个中等级别** 的 Bug / 安全问题，已全部修复。
+代码审查发现 **4 个严重级别** 和 **2 个中等级别** 的 Bug / 安全问题，已全部修复。
 
 ---
 
@@ -48,18 +48,11 @@ return redirect(url_for("index"))
 
 **问题描述：**  
 首页模板中包含了 `{{ user['password'] }}` 字段，登录后页面会直接显示用户的明文密码。  
-这是严重的信息泄露，在屏幕上、截图或肩窥场景下都会暴露敏感信息。
+这是严重的信息泄露。
 
 **修复方案：**
 1. 从 `index.html` 模板中移除密码字段
 2. 新增 `get_user_info()` 安全函数，返回用户数据时自动剔除 `password`
-
-```python
-def get_user_info(username):
-    user = USERS[username].copy()
-    user.pop("password", None)
-    return user
-```
 
 ---
 
@@ -69,11 +62,7 @@ def get_user_info(username):
 **涉及文件：** `templates/login.html`
 
 **问题描述：**  
-文件第一行存在 HTML 注释：
-```html
-<!-- 调试信息 - 默认管理员账号 用户名: admin 密码: admin123 -->
-```
-任何用户按 `F12` 查看页面源码即可获取管理员账号密码，可以直接登录管理员账户。
+文件第一行存在 HTML 注释暴露默认管理员账号密码。
 
 **修复方案：**  
 移除该行注释。
@@ -90,9 +79,9 @@ def get_user_info(username):
 - `app.secret_key` 硬编码为固定值 `"dev-key-2025"`
 
 **修复方案：**
-1. **密码哈希存储** — 使用 `werkzeug.security.generate_password_hash()` 对密码进行 scrypt 哈希处理后存储，数据库/字典中不再存明文
-2. **恒定时间比较** — 新增 `verify_login()` 函数，内部使用 `check_password_hash()` 验证密码。用户名不存在时也对空哈希做一次 `check_password_hash`，保证每次登录响应时间一致，从根本上防御时序攻击（timing attack）
-3. **随机 secret_key** — 使用 `secrets.token_hex(32)` 生成密钥，替代硬编码固定值
+1. **密码哈希存储** — 使用 `werkzeug.security.generate_password_hash()` 进行 scrypt 哈希存储
+2. **恒定时间比较** — 新增 `verify_login()`，用户名不存在时也对空哈希做一次校验，防御时序攻击
+3. **随机 secret_key** — 使用 `secrets.token_hex(32)` 自动生成密钥
 
 ---
 
@@ -102,55 +91,70 @@ def get_user_info(username):
 **涉及文件：** `app.py` – `login()` 路由
 
 **问题描述：**  
-未对空的用户名/密码做校验，直接查询字典，用户体验和健壮性差。
+未对空的用户名/密码做校验，直接查询字典。
 
 **修复方案：**  
-增加空值校验，返回明确的错误提示。
-
-```python
-if not username or not password:
-    error = "用户名和密码不能为空"
-```
+增加空值校验，返回明确错误提示。
 
 ---
 
 ### 🚨 Bug 6：垂直越权（Vertical Privilege Escalation）
 
-**严重级别：** 严重
+**严重级别：** 严重  
 **涉及文件：** `app.py` – 所有路由
 
 **问题描述：**  
-系统设计了 `admin`（管理员）和 `user`（普通用户）两个角色，但代码中没有任何权限校验机制。如果后续增加管理员专属接口（如用户管理、数据面板），普通用户可以直接越权访问。即使当前只有一个首页路由，这种架构缺陷也为后续扩展埋下了严重安全隐患。
+系统设计了 `admin` 和 `user` 两个角色，但没有任何权限校验。如果后续增加管理员专属接口，普通用户可直接越权访问。
 
 **修复方案：**  
 新增 `login_required()` 装饰器，支持角色白名单控制：
 
 ```python
-def login_required(roles=None):
-    """
-    登录验证 + 角色权限控制装饰器
-    使用方式：
-        @login_required()                # 仅需登录
-        @login_required(roles=["admin"])  # 仅管理员可访问
-    """
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            username = session.get("username")
-            if not username:
-                return redirect(url_for("login"))
-            if roles and username in USERS:
-                user_role = USERS[username].get("role", "user")
-                if user_role not in roles:
-                    abort(403)
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
+@login_required()                    # 任意登录用户
+@login_required(roles=["admin"])     # 仅管理员
+@login_required(roles=["admin", "user"])  # 多人种角色
 ```
 
-使用方式：
-- `@login_required()` → 任意登录用户均可访问
-- `@login_required(roles=["admin"])` → 仅管理员可访问，普通用户返回 403
+无权限时返回 403 Forbidden。
+
+---
+
+### 🚨 Bug 7：缺少防爆破机制
+
+**严重级别：** 严重  
+**涉及文件：** `app.py`、`templates/login.html`
+
+**问题描述：**  
+登录接口无任何限制，攻击者可无限次尝试用户名密码进行暴力破解。
+
+**修复方案：**
+
+| 阶段 | 触发条件 | 后果 |
+|------|----------|------|
+| 1-4 次失败 | 仅延迟 | 指数回退：1s → 2s → 4s → 8s（最多 30s） |
+| 5-9 次失败 | 延迟 + 验证码 | 需正确输入 PIL 生成图片验证码（含干扰线 + 噪点） |
+| ≥10 次失败 | 锁定 5 分钟 | 同一 IP+用户名组合无法登录 |
+
+**核心代码：**
+
+```python
+def apply_delay_on_failure():
+    """登录失败时指数回退延迟"""
+    delay = BASE_DELAY * (2 ** (count - 1))
+    delay = min(delay, 30.0)
+    time.sleep(delay)
+
+def check_rate_limit():
+    """检查是否需要验证码或是否已锁定"""
+    if record["locked_until"] > now:
+        return True    # 已锁定
+    captcha_required = record["count"] >= MAX_LOGIN_ATTEMPTS  # 5次后
+    return False, captcha_required
+```
+
+- 验证码：使用 PIL 生成 4 位随机字符（排除易混淆字符如 0/O/1/I），含随机颜色、干扰线和噪点
+- 成功后自动清除失败记录
+- IP 追踪兼容 `X-Forwarded-For` 代理场景
 
 ---
 
@@ -162,7 +166,8 @@ def login_required(roles=None):
 | 增加 `.strip()` | 对用户名做首尾空白处理 |
 | 代码注释 | 增加 `TODO` 标记，提示生产环境改进方向 |
 | 安全函数封装 | `get_user_info()` 统一管理用户数据暴露范围 |
-| 时序攻击防护 | `verify_login()` 即使用户名不存在也执行哈希计算，响应时间恒定 |
+| 时序攻击防护 | `verify_login()` 即使用户名不存在也执行哈希计算 |
+| 验证码 | 使用 PIL 生成含干扰线和随机噪点的图片验证码 |
 
 ---
 
@@ -170,9 +175,9 @@ def login_required(roles=None):
 
 | 文件 | 操作 |
 |------|------|
-| `app.py` | ✅ 修复 |
-| `templates/index.html` | ✅ 修复 |
-| `templates/login.html` | ✅ 修复 |
+| `app.py` | ✅ 修复（新增防爆破、验证码、权限装饰器） |
+| `templates/index.html` | ✅ 修复（移除密码字段） |
+| `templates/login.html` | ✅ 修复（移除注释 + 新增验证码 UI） |
 | `templates/base.html` | 未改动 |
 | `static/css/style.css` | 未改动 |
 
@@ -184,17 +189,17 @@ def login_required(roles=None):
 
 ```bash
 cd /opt/Class01/项目
-pip install flask
+pip install flask pillow
 python app.py
 # 浏览器访问 http://localhost:5000
 ```
 
-- 登录 `admin / admin123` 后应正确跳转到首页
-- 首页不应显示密码字段
-- 查看登录页页面源码，不应看到管理员凭证注释
+- 登录 `admin / admin123` 后应正确跳转到首页，不显示密码
+- 查看登录页源码，不应看到管理员凭证注释
+- 连续 5 次错误登录后应弹出验证码
+- 连续 10 次错误后应锁定显示剩余时间
 - 提交空表单应有错误提示
-- 验证密码哈希：登录正确/错误用户，响应时间无明显差异（时序攻击防护）
-- 验证 secret_key：每次 Flask 重启 session 要重新登录（因为密钥随机生成）
+- 未登录直接访问 `/` 应重定向到登录页
 
 ---
 
