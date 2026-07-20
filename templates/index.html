@@ -11,6 +11,44 @@
             <li><span class="label">角色：</span>{{ user['role'] }}</li>
             <li><span class="label">余额：</span>{{ user['balance'] }}</li>
         </ul>
+
+        <hr class="divider">
+
+        <h3>搜索用户</h3>
+        <form method="get" action="/search" class="search-form">
+            <div class="form-group search-group">
+                <input type="text" id="keyword" name="keyword" placeholder="输入用户名或邮箱搜索…" value="{{ keyword or '' }}">
+                <button type="submit" class="btn btn-primary">搜索</button>
+            </div>
+        </form>
+
+        {% if results is defined and keyword %}
+            {% if results %}
+                <table class="table search-results">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>用户名</th>
+                            <th>邮箱</th>
+                            <th>手机</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    {% for r in results %}
+                        <tr>
+                            <td>{{ r['id'] }}</td>
+                            <td>{{ r['username'] }}</td>
+                            <td>{{ r['email'] }}</td>
+                            <td>{{ r['phone'] }}</td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <p class="no-results">无搜索结果</p>
+            {% endif %}
+        {% endif %}
+
         <a href="/logout" class="btn btn-primary">退出登录</a>
     {% else %}
         <h2>请先登录</h2>

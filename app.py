@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, redirect, session, url_for, abort,\
-    make_response
+    make_response, flash
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 import secrets
@@ -7,6 +7,8 @@ import time
 import hashlib
 import io
 import base64
+import sqlite3
+import os
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -208,10 +210,22 @@ USERS = {
 
 def get_user_info(username):
     """返回不包含密码的用户信息"""
-    if username and username in USERS:
-        user = USERS[username].copy()
-        user.pop("password", None)
-        return user
+    if not username:
+        return None
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT username, email, phone FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "username": row["username"],
+            "email": row["email"],
+            "phone": row["phone"],
+            "role": "admin" if row["username"] == "admin" else "user",
+            "balance": 99999 if row["username"] == "admin" else 100
+        }
     return None
 
 
@@ -228,9 +242,9 @@ def login_required(roles=None):
             username = session.get("username")
             if not username:
                 return redirect(url_for("login"))
-            if roles and username in USERS:
-                user_role = USERS[username].get("role", "user")
-                if user_role not in roles:
+            if roles:
+                user_info = get_user_info(username)
+                if user_info and user_info.get("role", "user") not in roles:
                     abort(403)
             return f(*args, **kwargs)
         return decorated_function
@@ -240,16 +254,58 @@ def login_required(roles=None):
 def verify_login(username, password):
     """
     验证用户名密码，使用恒定时间比较防止时序攻击。
-    无论用户名是否存在，都执行哈希验证以避免响应时间差异。
+    从 SQLite 数据库中查询用户密码哈希。
     """
-    if username in USERS:
-        return check_password_hash(USERS[username]["password"], password)
+    conn = sqlite3.connect(DATABASE_PATH)
+    c = conn.cursor()
+    c.execute("SELECT password FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return check_password_hash(row[0], password)
     # 用户名不存在时，也对空哈希做一次 check 保持耗时恒定
     check_password_hash(
         "scrypt:32768:8:1$dummy$dummyhashaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         password
     )
     return False
+
+
+# ============================================================
+# 数据库
+# ============================================================
+
+DATABASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+DATABASE_PATH = os.path.join(DATABASE_DIR, "users.db")
+
+
+def init_db():
+    """初始化 SQLite 数据库，创建 users 表并插入默认用户"""
+    os.makedirs(DATABASE_DIR, exist_ok=True)
+    conn = sqlite3.connect(DATABASE_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            email TEXT,
+            phone TEXT
+        )
+    ''')
+    # 插入默认用户（使用哈希密码以兼容现有登录）
+    default_users = [
+        ("admin",  generate_password_hash("admin123"),  "admin@example.com",  "13800138000"),
+        ("alice",  generate_password_hash("alice2025"), "alice@example.com", "13900139001"),
+    ]
+    for u, p, e, ph in default_users:
+        c.execute(
+            "INSERT OR IGNORE INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)",
+            (u, p, e, ph)
+        )
+    conn.commit()
+    conn.close()
+    print("[DB] 数据库初始化完成")
 
 
 # ============================================================
@@ -354,6 +410,69 @@ def captcha_image():
         return captcha_text
 
 
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    """用户注册 - 已修复：使用参数化查询 + 密码哈希存储"""
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        email = request.form.get("email", "").strip()
+        phone = request.form.get("phone", "").strip()
+
+        if not username or not password:
+            error = "用户名和密码不能为空"
+        else:
+            # ✅ 已修复：参数化查询，防止 SQL 注入
+            conn = sqlite3.connect(DATABASE_PATH)
+            c = conn.cursor()
+            password_hash = generate_password_hash(password)
+            query = "INSERT INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)"
+            print(f"[SQL] 注册(参数化): {query}")
+            try:
+                c.execute(query, (username, password_hash, email, phone))
+                conn.commit()
+                flash("注册成功，请登录")
+                return redirect(url_for("login"))
+            except sqlite3.IntegrityError:
+                error = "用户名已存在"
+            except Exception as e:
+                error = f"注册失败: {e}"
+            finally:
+                conn.close()
+
+    return render_template("register.html", error=error)
+
+
+@app.route("/search")
+@login_required()
+def search():
+    """用户搜索 - 已修复：使用参数化查询"""
+    keyword = request.args.get("keyword", "").strip()
+    results = []
+    search_sql = None
+
+    if keyword:
+        # ✅ 已修复：参数化查询 + LIKE 拼接使用 ? 占位符
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        search_sql = "SELECT * FROM users WHERE username LIKE ? OR email LIKE ?"
+        like_pattern = f"%{keyword}%"
+        print(f"[SQL] 搜索(参数化): {search_sql} 参数: ('{like_pattern}', '{like_pattern}')")
+        try:
+            rows = c.execute(search_sql, (like_pattern, like_pattern)).fetchall()
+            results = [dict(row) for row in rows]
+        except Exception as e:
+            print(f"[SQL] 搜索错误: {e}")
+        finally:
+            conn.close()
+
+    username = session.get("username")
+    user = get_user_info(username)
+    return render_template("index.html", user=user, results=results, keyword=keyword)
+
+
 @app.route("/logout")
 def logout():
     session.pop("username", None)
@@ -362,4 +481,5 @@ def logout():
 
 
 if __name__ == "__main__":
+    init_db()
     app.run(debug=True, host="0.0.0.0", port=5000)
