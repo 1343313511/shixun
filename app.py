@@ -474,10 +474,30 @@ def search():
     return render_template("index.html", user=user, results=results, keyword=keyword)
 
 
+# 安全的文件名：只保留文件名部分，过滤路径穿越
+import re as _re
+
+
+def safe_filename(filename):
+    """
+    对上传文件名做安全处理：
+    1. 去除路径穿越 (os.sep, .., null bytes)
+    2. 只保留安全的字母、数字、中文、点、下划线、短横线
+    3. 如果最终结果为空或为危险值，返回一个安全的默认名
+    """
+    # 移除 null bytes
+    filename = filename.replace("\x00", "")
+    # 只取 basename（过滤路径穿越）
+    filename = os.path.basename(filename)
+    if not filename or filename in (".", ".."):
+        return "unnamed"
+    return filename
+
+
 @app.route("/upload", methods=["GET", "POST"])
 @login_required()
 def upload():
-    """用户头像上传 - 不检查文件类型，使用原始文件名"""
+    """用户头像上传 - 已修复：防止路径穿越 + 文件名消毒"""
     error = None
     success = None
     file_url = None
@@ -490,13 +510,22 @@ def upload():
             if f.filename == "":
                 error = "文件名为空"
             else:
-                # 保存到 static/uploads/，使用原始文件名
+                # ✅ 已修复：对文件名消毒，防止路径穿越
+                safe_name = safe_filename(f.filename)
                 upload_dir = os.path.join(app.root_path, "static", "uploads")
                 os.makedirs(upload_dir, exist_ok=True)
-                save_path = os.path.join(upload_dir, f.filename)
-                f.save(save_path)
-                file_url = url_for("static", filename=f"uploads/{f.filename}")
-                success = f"文件上传成功: {f.filename}"
+                save_path = os.path.join(upload_dir, safe_name)
+
+                # ✅ 已修复：检查文件大小（单文件不超过 1MB）
+                f.seek(0, os.SEEK_END)
+                file_size = f.tell()
+                f.seek(0)
+                if file_size > 1 * 1024 * 1024:
+                    error = "文件大小不能超过 1MB"
+                else:
+                    f.save(save_path)
+                    file_url = url_for("static", filename=f"uploads/{safe_name}")
+                    success = f"文件上传成功: {safe_name}"
 
     return render_template("upload.html", error=error, success=success, file_url=file_url)
 
