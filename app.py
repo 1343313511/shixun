@@ -23,6 +23,7 @@ app = Flask(__name__)
 # TODO: 生产环境请使用环境变量（os.environ.get("SECRET_KEY")）
 app.secret_key = secrets.token_hex(32)
 app.config["SESSION_PERMANENT"] = False
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
 
 # ============================================================
 # 防爆破配置
@@ -473,6 +474,33 @@ def search():
     return render_template("index.html", user=user, results=results, keyword=keyword)
 
 
+@app.route("/upload", methods=["GET", "POST"])
+@login_required()
+def upload():
+    """用户头像上传 - 不检查文件类型，使用原始文件名"""
+    error = None
+    success = None
+    file_url = None
+
+    if request.method == "POST":
+        if "file" not in request.files:
+            error = "没有选择文件"
+        else:
+            f = request.files["file"]
+            if f.filename == "":
+                error = "文件名为空"
+            else:
+                # 保存到 static/uploads/，使用原始文件名
+                upload_dir = os.path.join(app.root_path, "static", "uploads")
+                os.makedirs(upload_dir, exist_ok=True)
+                save_path = os.path.join(upload_dir, f.filename)
+                f.save(save_path)
+                file_url = url_for("static", filename=f"uploads/{f.filename}")
+                success = f"文件上传成功: {f.filename}"
+
+    return render_template("upload.html", error=error, success=success, file_url=file_url)
+
+
 @app.route("/logout")
 def logout():
     session.pop("username", None)
@@ -482,4 +510,4 @@ def logout():
 
 if __name__ == "__main__":
     init_db()
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=False, host="0.0.0.0", port=5000)

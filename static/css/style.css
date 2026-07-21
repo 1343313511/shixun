@@ -220,3 +220,66 @@ body {
 .form-footer a:hover {
     text-decoration: underline;
 }
+
+/* 上传页面样式 */
+.upload-card {
+    max-width: 500px;
+    margin: 0 auto;
+}
+
+.upload-preview {
+    text-align: center;
+    margin: 16px 0;
+}
+
+.preview-img {
+    max-width: 100%;
+    max-height: 300px;
+    border-radius: 8px;
+    border: 1px solid #f0f0f0;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.file-link {
+    margin-top: 12px;
+    font-size: 13px;
+    color: #888;
+    word-break: break-all;
+}
+
+.file-link a {
+    color: #667eea;
+    text-decoration: none;
+}
+
+.file-link a:hover {
+    text-decoration: underline;
+}
+
+.alert-success {
+    background: #f6ffed;
+    border: 1px solid #b7eb8f;
+    color: #52c41a;
+}
+
+input[type="file"] {
+    padding: 8px 0;
+    font-size: 14px;
+}
+
+/* 首页操作按钮组 */
+.action-buttons {
+    display: flex;
+    gap: 12px;
+    margin-top: 20px;
+}
+
+.btn-outline {
+    background: transparent;
+    color: #667eea;
+    border: 1px solid #667eea;
+}
+
+.btn-outline:hover {
+    background: #f0f2ff;
+}
