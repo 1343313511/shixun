@@ -9,7 +9,7 @@
             <li><span class="label">用户名：</span>{{ profile_user['username'] }}</li>
             <li><span class="label">邮箱：</span>{{ profile_user['email'] }}</li>
             <li><span class="label">手机：</span>{{ profile_user['phone'] }}</li>
-            <li><span class="label">余额：</span>{{ profile_user['balance'] }}</li>
+            <li><span class="label">余额：</span>{{ "%.2f"|format(profile_user['balance'] / 100.0) }} 元</li>
         </ul>
 
         <hr class="divider">

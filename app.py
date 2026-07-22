@@ -9,32 +9,31 @@ import io
 import base64
 import sqlite3
 import os
+import html as _html
+import re as _re
+from contextlib import contextmanager
 
 try:
     from PIL import Image, ImageDraw, ImageFont
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
-    import random as _random
-    import string as _string
 
 
 app = Flask(__name__)
-# TODO: 生产环境请使用环境变量（os.environ.get("SECRET_KEY")）
-app.secret_key = secrets.token_hex(32)
+# ❗ 生产环境请使用固定密钥或环境变量，否则每次重启会话会失效
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 app.config["SESSION_PERMANENT"] = False
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
 
 # ============================================================
 # 防爆破配置
 # ============================================================
-# 内存中存储登录失败记录（生产环境请改用 Redis）
-# login_attempts[client_ip] = {"count": int, "last_time": float}
 login_attempts = {}
 
 # 允许最大尝试次数（超过需验证码）
 MAX_LOGIN_ATTEMPTS = 5
-# 锁定时间（秒）：超过 MAX_LOGIN_ATTEMPTS 后需等待
+# 锁定时间（秒）
 LOCKOUT_SECONDS = 300  # 5 分钟
 # 基础延迟（秒），失败后指数回退
 BASE_DELAY = 1.0
@@ -81,10 +80,6 @@ def check_rate_limit():
     # --- 判断是否需要验证码 ---
     captcha_required = record["count"] >= MAX_LOGIN_ATTEMPTS
 
-    if captcha_required:
-        # 需要验证码，但不阻断（验证码校验在 login 路由中处理）
-        pass
-
     return False, captcha_required, 0, None
 
 
@@ -106,7 +101,6 @@ def apply_delay_on_failure():
         record["locked_until"] = now + LOCKOUT_SECONDS
         record["count"] = 0  # 重置计数
         login_attempts[key] = record
-        # 锁定时直接返回，不再等待
         return
 
     login_attempts[key] = record
@@ -157,9 +151,10 @@ def generate_captcha_image(text):
 
         x_offset = 10
         for ch in text:
-            # 随机上下偏移
             y_offset = secrets.randbelow(6)
-            r, g, b = secrets.randbelow(80) + 40, secrets.randbelow(80) + 40, secrets.randbelow(80) + 40
+            r = secrets.randbelow(80) + 40
+            g = secrets.randbelow(80) + 40
+            b = secrets.randbelow(80) + 40
             draw.text((x_offset, 6 + y_offset), ch, fill=(r, g, b), font=font)
             x_offset += 26
 
@@ -173,16 +168,61 @@ def generate_captcha_image(text):
         image.save(buf, format="PNG")
         return base64.b64encode(buf.getvalue()).decode()
     else:
-        # 无 PIL 时返回纯文本验证码（不推荐，但兜底）
         return None
 
 
+# ============================================================
+# CSRF 保护
+# ============================================================
+
+def generate_csrf_token():
+    """生成并存储 CSRF token 到 session"""
+    if "_csrf_token" not in session:
+        session["_csrf_token"] = secrets.token_hex(32)
+    return session["_csrf_token"]
+
+
+def validate_csrf_token():
+    """校验 CSRF token，失败则抛出异常"""
+    token = request.form.get("_csrf_token", "")
+    expected = session.pop("_csrf_token", None)
+    if not expected or not secrets.compare_digest(expected, token):
+        return False
+    return True
+
+
 @app.context_processor
-def inject_captcha():
-    """向模板注入验证码图片"""
-    return {
+def inject_globals():
+    """向所有模板注入全局变量"""
+    ctx = {
         "HAS_CAPTCHA": True,
+        "csrf_token": generate_csrf_token(),
     }
+    username = session.get("username")
+    if username:
+        user = get_user_info(username)
+        if user:
+            ctx["current_user"] = user
+    return ctx
+
+
+# ============================================================
+# 数据库工具
+# ============================================================
+
+DATABASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+DATABASE_PATH = os.path.join(DATABASE_DIR, "users.db")
+
+
+@contextmanager
+def get_db():
+    """数据库连接上下文管理器，确保连接正常关闭"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        yield conn
+    finally:
+        conn.close()
 
 
 # ============================================================
@@ -192,7 +232,7 @@ def inject_captcha():
 USERS = {
     "admin": {
         "username": "admin",
-        "password": "scrypt:32768:8:1$yFeYAXJWMmoohX6i$3609ceeaf2f515e413ce3701c289c1e6cf7b46074995047edf296d050be2c4d33fc746e89c6c29a3d448d86282b1b685a56a59c434b38533ba168de9c9344eb8",
+        "password": "scrypt…4eb8",
         "role": "admin",
         "email": "admin@example.com",
         "phone": "13800138000",
@@ -200,7 +240,7 @@ USERS = {
     },
     "alice": {
         "username": "alice",
-        "password": "scrypt:32768:8:1$SrCh5oMHKUUagSls$3eb6fa466b401017ea33666d9b33e93922c5d589e5452355e0abc6f5d3577a01b42baa85874d678c89f2a8d164a2b27967992dea05e05a560a1b9c1c4e3c1836",
+        "password": "scrypt…1836",
         "role": "user",
         "email": "alice@example.com",
         "phone": "13900139001",
@@ -213,30 +253,51 @@ def get_user_info(username):
     """返回不包含密码的用户信息"""
     if not username:
         return None
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT id, username, email, phone, balance FROM users WHERE username = ?", (username,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            "id": row["id"],
-            "username": row["username"],
-            "email": row["email"],
-            "phone": row["phone"],
-            "role": "admin" if row["username"] == "admin" else "user",
-            "balance": row["balance"]
-        }
-    return None
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, username, email, phone, balance FROM users WHERE username = ?",
+            (username,)
+        )
+        row = c.fetchone()
+        if row:
+            return {
+                "id": row["id"],
+                "username": row["username"],
+                "email": row["email"],
+                "phone": row["phone"],
+                "role": "admin" if row["username"] == "admin" else "user",
+                "balance": row["balance"] if row["balance"] is not None else 0
+            }
+        return None
+
+
+def get_user_by_id(user_id):
+    """通过 id 获取用户信息"""
+    if not user_id:
+        return None
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, username, email, phone, balance FROM users WHERE id = ?",
+            (user_id,)
+        )
+        row = c.fetchone()
+        if row:
+            return {
+                "id": row["id"],
+                "username": row["username"],
+                "email": row["email"],
+                "phone": row["phone"],
+                "role": "admin" if row["username"] == "admin" else "user",
+                "balance": row["balance"] if row["balance"] is not None else 0
+            }
+        return None
 
 
 def login_required(roles=None):
     """
     登录验证 + 角色权限控制装饰器
-    使用方式：
-        @login_required()               # 仅需登录
-        @login_required(roles=["admin"]) # 仅管理员可访问
     """
     def decorator(f):
         @wraps(f)
@@ -256,15 +317,13 @@ def login_required(roles=None):
 def verify_login(username, password):
     """
     验证用户名密码，使用恒定时间比较防止时序攻击。
-    从 SQLite 数据库中查询用户密码哈希。
     """
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT password FROM users WHERE username = ?", (username,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return check_password_hash(row[0], password)
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT password FROM users WHERE username = ?", (username,))
+        row = c.fetchone()
+        if row:
+            return check_password_hash(row[0], password)
     # 用户名不存在时，也对空哈希做一次 check 保持耗时恒定
     check_password_hash(
         "scrypt:32768:8:1$dummy$dummyhashaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -274,12 +333,8 @@ def verify_login(username, password):
 
 
 # ============================================================
-# 数据库
+# 数据库初始化
 # ============================================================
-
-DATABASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-DATABASE_PATH = os.path.join(DATABASE_DIR, "users.db")
-
 
 def init_db():
     """初始化 SQLite 数据库，创建 users 表并插入默认用户"""
@@ -292,18 +347,18 @@ def init_db():
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
             email TEXT,
-            phone TEXT
+            phone TEXT,
+            balance INTEGER DEFAULT 0
         )
     ''')
-    # 插入默认用户（使用哈希密码以兼容现有登录）
     default_users = [
-        ("admin",  generate_password_hash("admin123"),  "admin@example.com",  "13800138000"),
-        ("alice",  generate_password_hash("alice2025"), "alice@example.com", "13900139001"),
+        ("admin",  generate_password_hash("admin123"),  "admin@example.com",  "13800138000", 99999),
+        ("alice",  generate_password_hash("alice2025"), "alice@example.com", "13900139001", 100),
     ]
-    for u, p, e, ph in default_users:
+    for u, p, e, ph, bal in default_users:
         c.execute(
-            "INSERT OR IGNORE INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)",
-            (u, p, e, ph)
+            "INSERT OR IGNORE INTO users (username, password, email, phone, balance) VALUES (?, ?, ?, ?, ?)",
+            (u, p, e, ph, bal)
         )
     conn.commit()
     conn.close()
@@ -361,7 +416,6 @@ def login():
             if not captcha_input or captcha_input != expected:
                 error = "验证码错误"
                 apply_delay_on_failure()
-                # 生成新的验证码
                 captcha_text = generate_captcha_text()
                 session["captcha"] = captcha_text
                 captcha_img = generate_captcha_image(captcha_text)
@@ -375,12 +429,12 @@ def login():
         if verify_login(username, password):
             on_login_success()
             session["username"] = username
+            flash("登录成功")
             return redirect(url_for("index"))
         else:
             error = "用户名或密码错误"
             apply_delay_on_failure()
 
-            # 失败后重新检查是否需要验证码
             _, captcha_required, _, _ = check_rate_limit()
             if captcha_required:
                 captcha_text = generate_captcha_text()
@@ -388,7 +442,6 @@ def login():
                 captcha_img = generate_captcha_image(captcha_text)
 
     else:
-        # GET 请求：清除验证码
         session.pop("captcha", None)
 
     return render_template(
@@ -414,7 +467,7 @@ def captcha_image():
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
-    """用户注册 - 已修复：使用参数化查询 + 密码哈希存储"""
+    """用户注册"""
     error = None
     if request.method == "POST":
         username = request.form.get("username", "").strip()
@@ -424,24 +477,24 @@ def register():
 
         if not username or not password:
             error = "用户名和密码不能为空"
+        elif len(username) < 2 or len(username) > 32:
+            error = "用户名长度应为 2~32 个字符"
+        elif len(password) < 6:
+            error = "密码长度不能少于 6 个字符"
         else:
-            # ✅ 已修复：参数化查询，防止 SQL 注入
-            conn = sqlite3.connect(DATABASE_PATH)
-            c = conn.cursor()
             password_hash = generate_password_hash(password)
-            query = "INSERT INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)"
-            print(f"[SQL] 注册(参数化): {query}")
+            query = "INSERT INTO users (username, password, email, phone, balance) VALUES (?, ?, ?, ?, 0)"
             try:
-                c.execute(query, (username, password_hash, email, phone))
-                conn.commit()
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute(query, (username, password_hash, email, phone))
+                    conn.commit()
                 flash("注册成功，请登录")
                 return redirect(url_for("login"))
             except sqlite3.IntegrityError:
                 error = "用户名已存在"
             except Exception as e:
                 error = f"注册失败: {e}"
-            finally:
-                conn.close()
 
     return render_template("register.html", error=error)
 
@@ -449,46 +502,43 @@ def register():
 @app.route("/search")
 @login_required()
 def search():
-    """用户搜索 - 已修复：使用参数化查询"""
+    """用户搜索"""
     keyword = request.args.get("keyword", "").strip()
     results = []
-    search_sql = None
 
     if keyword:
-        # ✅ 已修复：参数化查询 + LIKE 拼接使用 ? 占位符
-        conn = sqlite3.connect(DATABASE_PATH)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        search_sql = "SELECT * FROM users WHERE username LIKE ? OR email LIKE ?"
-        like_pattern = f"%{keyword}%"
-        print(f"[SQL] 搜索(参数化): {search_sql} 参数: ('{like_pattern}', '{like_pattern}')")
-        try:
-            rows = c.execute(search_sql, (like_pattern, like_pattern)).fetchall()
-            results = [dict(row) for row in rows]
-        except Exception as e:
-            print(f"[SQL] 搜索错误: {e}")
-        finally:
-            conn.close()
+        with get_db() as conn:
+            c = conn.cursor()
+            search_sql = "SELECT * FROM users WHERE username LIKE ? OR email LIKE ?"
+            like_pattern = f"%{keyword}%"
+            print(f"[SQL] 搜索(参数化): {search_sql} 参数: ('{like_pattern}', '{like_pattern}')")
+            try:
+                rows = c.execute(search_sql, (like_pattern, like_pattern)).fetchall()
+                results = [dict(row) for row in rows]
+            except Exception as e:
+                print(f"[SQL] 搜索错误: {e}")
+
+        # HTML 转义防止 XSS
+        for r in results:
+            r["username"] = _html.escape(str(r["username"]))
+            r["email"] = _html.escape(str(r.get("email", "")))
+            if "phone" in r:
+                r["phone"] = _html.escape(str(r.get("phone", "")))
 
     username = session.get("username")
     user = get_user_info(username)
-    return render_template("index.html", user=user, results=results, keyword=keyword)
-
-
-# 安全的文件名：只保留文件名部分，过滤路径穿越
-import re as _re
+    safe_keyword = _html.escape(keyword) if keyword else keyword
+    return render_template("index.html", user=user, results=results, keyword=safe_keyword)
 
 
 def safe_filename(filename):
     """
     对上传文件名做安全处理：
     1. 去除路径穿越 (os.sep, .., null bytes)
-    2. 只保留安全的字母、数字、中文、点、下划线、短横线
-    3. 如果最终结果为空或为危险值，返回一个安全的默认名
+    2. 只保留安全的字符
+    3. 如果最终结果为空返回默认名
     """
-    # 移除 null bytes
     filename = filename.replace("\x00", "")
-    # 只取 basename（过滤路径穿越）
     filename = os.path.basename(filename)
     if not filename or filename in (".", ".."):
         return "unnamed"
@@ -498,7 +548,7 @@ def safe_filename(filename):
 @app.route("/upload", methods=["GET", "POST"])
 @login_required()
 def upload():
-    """用户头像上传 - 已修复：防止路径穿越 + 文件名消毒"""
+    """用户头像上传"""
     error = None
     success = None
     file_url = None
@@ -511,22 +561,44 @@ def upload():
             if f.filename == "":
                 error = "文件名为空"
             else:
-                # ✅ 已修复：对文件名消毒，防止路径穿越
                 safe_name = safe_filename(f.filename)
                 upload_dir = os.path.join(app.root_path, "static", "uploads")
                 os.makedirs(upload_dir, exist_ok=True)
-                save_path = os.path.join(upload_dir, safe_name)
 
-                # ✅ 已修复：检查文件大小（单文件不超过 1MB）
+                # ✅ 修复：以用户 ID 前缀保存，防止不同用户同名文件覆盖
+                username = session.get("username", "anon")
+                user_prefix = hashlib.md5(username.encode()).hexdigest()[:8]
+                name_part, ext_part = os.path.splitext(safe_name)
+                unique_name = f"{user_prefix}_{name_part}{ext_part}"
+                save_path = os.path.join(upload_dir, unique_name)
+
+                # 检查文件大小（单文件不超过 1MB）
                 f.seek(0, os.SEEK_END)
                 file_size = f.tell()
                 f.seek(0)
                 if file_size > 1 * 1024 * 1024:
                     error = "文件大小不能超过 1MB"
                 else:
-                    f.save(save_path)
-                    file_url = url_for("static", filename=f"uploads/{safe_name}")
-                    success = f"文件上传成功: {safe_name}"
+                    # 通过文件魔数校验
+                    f.seek(0)
+                    file_bytes = f.read(12)
+                    f.seek(0)
+                    is_image = False
+                    if file_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+                        is_image = True
+                    elif file_bytes[:2] in (b"\xff\xd8",):
+                        is_image = True
+                    elif file_bytes[:3] == b"GIF":
+                        is_image = True
+                    elif file_bytes[:4] == b"RIFF" and file_bytes[8:12] == b"WEBP":
+                        is_image = True
+
+                    if not is_image:
+                        error = "只允许上传图片文件（PNG/JPEG/GIF/WebP）"
+                    else:
+                        f.save(save_path)
+                        file_url = url_for("static", filename=f"uploads/{unique_name}")
+                        success = f"文件上传成功: {unique_name}"
 
     return render_template("upload.html", error=error, success=success, file_url=file_url)
 
@@ -534,63 +606,92 @@ def upload():
 @app.route("/profile")
 @login_required()
 def profile():
-    """个人中心 - 从 URL 参数获取 user_id，不验证权限"""
+    """个人中心 - 只能查看自己的资料"""
+    current_user = get_user_info(session.get("username"))
+    if not current_user:
+        return redirect(url_for("login"))
+
     user_id = request.args.get("user_id", "")
-    user_info = None
 
-    if user_id:
-        conn = sqlite3.connect(DATABASE_PATH)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT id, username, email, phone, balance FROM users WHERE id = ?", (user_id,))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            user_info = {
-                "id": row["id"],
-                "username": row["username"],
-                "email": row["email"],
-                "phone": row["phone"],
-                "balance": row["balance"]
-            }
+    # IDOR 防护：user_id 必须与当前登录用户一致
+    if user_id and str(user_id) != str(current_user["id"]):
+        flash("无权查看其他用户的资料")
+        return redirect(url_for("profile", user_id=current_user["id"]))
 
-    return render_template("profile.html", profile_user=user_info, user_id=user_id)
+    return render_template("profile.html", profile_user=current_user, user_id=user_id)
 
 
 @app.route("/recharge", methods=["POST"])
 @login_required()
 def recharge():
-    """充值 - 从表单接收 user_id 和 amount，直接加到余额"""
+    """充值 - 只能给自己充值，amount 必须为正数，余额用整数（分）存储"""
+    # CSRF 校验
+    if not validate_csrf_token():
+        flash("安全令牌验证失败，请重试")
+        return redirect(url_for("profile"))
+
+    current_user = get_user_info(session.get("username"))
+    if not current_user:
+        flash("请先登录")
+        return redirect(url_for("login"))
+
     user_id = request.form.get("user_id", "")
-    amount = request.form.get("amount", "0")
+    amount_str = request.form.get("amount", "0")
 
     try:
-        amount = float(amount)
         user_id_int = int(user_id)
     except (ValueError, TypeError):
         flash("参数错误")
         return redirect(url_for("profile"))
 
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT balance FROM users WHERE id = ?", (user_id_int,))
-    row = c.fetchone()
-    if row:
-        new_balance = row[0] + amount
-        c.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, user_id_int))
-        conn.commit()
-        flash(f"充值成功！当前余额: {new_balance}")
-    else:
-        flash("用户不存在")
-    conn.close()
+    # IDOR 防护：只能给自己充值
+    if user_id_int != current_user["id"]:
+        flash("无权操作其他用户的账户")
+        return redirect(url_for("profile"))
 
-    return redirect(url_for("profile", user_id=user_id))
+    try:
+        amount_yuan = float(amount_str)
+    except (ValueError, TypeError):
+        flash("金额格式错误")
+        return redirect(url_for("profile"))
+
+    if amount_yuan <= 0:
+        flash("充值金额必须为正数")
+        return redirect(url_for("profile"))
+
+    # 防止过大金额导致溢出
+    if amount_yuan > 9999999.99:
+        flash("单次充值金额不能超过 9999999.99 元")
+        return redirect(url_for("profile"))
+
+    amount_fen = int(round(amount_yuan * 100))
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE id = ?", (user_id_int,))
+        row = c.fetchone()
+        if row:
+            current_balance_fen = row[0] if row[0] is not None else 0
+            new_balance_fen = current_balance_fen + amount_fen
+
+            # 防止余额溢出
+            if new_balance_fen > 99999999999:
+                flash("充值后余额超出上限")
+                return redirect(url_for("profile"))
+
+            c.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance_fen, user_id_int))
+            conn.commit()
+            new_balance_yuan = new_balance_fen / 100.0
+            flash(f"充值成功！当前余额: {new_balance_yuan:.2f} 元")
+        else:
+            flash("用户不存在")
+
+    return redirect(url_for("profile"))
 
 
 @app.route("/logout")
 def logout():
-    session.pop("username", None)
-    session.pop("captcha", None)
+    session.clear()
     return redirect(url_for("index"))
 
 
