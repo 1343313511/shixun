@@ -216,16 +216,17 @@ def get_user_info(username):
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("SELECT username, email, phone FROM users WHERE username = ?", (username,))
+    c.execute("SELECT id, username, email, phone, balance FROM users WHERE username = ?", (username,))
     row = c.fetchone()
     conn.close()
     if row:
         return {
+            "id": row["id"],
             "username": row["username"],
             "email": row["email"],
             "phone": row["phone"],
             "role": "admin" if row["username"] == "admin" else "user",
-            "balance": 99999 if row["username"] == "admin" else 100
+            "balance": row["balance"]
         }
     return None
 
@@ -528,6 +529,62 @@ def upload():
                     success = f"文件上传成功: {safe_name}"
 
     return render_template("upload.html", error=error, success=success, file_url=file_url)
+
+
+@app.route("/profile")
+@login_required()
+def profile():
+    """个人中心 - 从 URL 参数获取 user_id，不验证权限"""
+    user_id = request.args.get("user_id", "")
+    user_info = None
+
+    if user_id:
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT id, username, email, phone, balance FROM users WHERE id = ?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            user_info = {
+                "id": row["id"],
+                "username": row["username"],
+                "email": row["email"],
+                "phone": row["phone"],
+                "balance": row["balance"]
+            }
+
+    return render_template("profile.html", profile_user=user_info, user_id=user_id)
+
+
+@app.route("/recharge", methods=["POST"])
+@login_required()
+def recharge():
+    """充值 - 从表单接收 user_id 和 amount，直接加到余额"""
+    user_id = request.form.get("user_id", "")
+    amount = request.form.get("amount", "0")
+
+    try:
+        amount = float(amount)
+        user_id_int = int(user_id)
+    except (ValueError, TypeError):
+        flash("参数错误")
+        return redirect(url_for("profile"))
+
+    conn = sqlite3.connect(DATABASE_PATH)
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE id = ?", (user_id_int,))
+    row = c.fetchone()
+    if row:
+        new_balance = row[0] + amount
+        c.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, user_id_int))
+        conn.commit()
+        flash(f"充值成功！当前余额: {new_balance}")
+    else:
+        flash("用户不存在")
+    conn.close()
+
+    return redirect(url_for("profile", user_id=user_id))
 
 
 @app.route("/logout")
