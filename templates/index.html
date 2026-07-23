@@ -2,7 +2,12 @@
 
 {% block content %}
 <div class="card">
-    {% if user %}
+    {% if page_content is defined and page_content %}
+        <a href="/" class="btn btn-outline btn-sm" style="margin-bottom:15px;">&larr; 返回首页</a>
+        <div class="page-content">
+            {{ page_content }}
+        </div>
+    {% elif user %}
         <h2>欢迎回来，{{ user['username'] }}！</h2>
         <ul class="user-info">
             <li><span class="label">用户名：</span>{{ user['username'] }}</li>
@@ -52,6 +57,7 @@
         <div class="action-buttons">
             <a href="/profile?user_id={{ user['id'] }}" class="btn btn-primary">个人中心</a>
             <a href="/upload" class="btn btn-primary">上传头像</a>
+            <a href="/page?name=help" class="btn btn-info">帮助中心</a>
             <a href="/logout" class="btn btn-outline">退出登录</a>
         </div>
     {% else %}

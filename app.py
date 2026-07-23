@@ -689,6 +689,45 @@ def recharge():
     return redirect(url_for("profile"))
 
 
+@app.route("/page", methods=["GET"])
+def dynamic_page():
+    """
+    动态页面加载 - 从 pages/ 目录加载页面内容
+    对 name 参数做安全处理，防止路径穿越
+    """
+    name = request.args.get("name", "")
+    
+    if not name:
+        page_content = "请指定页面名称，例如 /page?name=help"
+    else:
+        # 安全处理：仅提取文件名部分，去除路径分隔符和 .. 穿越
+        safe_name = os.path.basename(name)
+        if not safe_name:
+            page_content = "页面不存在"
+        else:
+            pages_dir = os.path.join(app.root_path, "pages")
+            page_path = os.path.normpath(os.path.join(pages_dir, safe_name))
+            
+            # 确保文件在 pages/ 目录内
+            if not page_path.startswith(os.path.normpath(pages_dir) + os.sep):
+                page_content = "页面不存在"
+            elif os.path.isfile(page_path):
+                with open(page_path, "r", encoding="utf-8") as f:
+                    page_content = f.read()
+            else:
+                # 尝试加上 .html 后缀
+                page_path_html = page_path + ".html"
+                if os.path.isfile(page_path_html):
+                    with open(page_path_html, "r", encoding="utf-8") as f:
+                        page_content = f.read()
+                else:
+                    page_content = "页面不存在"
+    
+    username = session.get("username")
+    user = get_user_info(username) if username else None
+    return render_template("index.html", user=user, page_content=page_content)
+
+
 @app.route("/logout")
 def logout():
     session.clear()
