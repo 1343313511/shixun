@@ -5,13 +5,19 @@ from functools import wraps
 import secrets
 import time
 import hashlib
+import ipaddress
 import io
 import base64
 import sqlite3
 import os
 import html as _html
 import re as _re
+import socket
+import ssl
 from contextlib import contextmanager
+import urllib.request
+import urllib.parse
+import urllib.error
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -189,6 +195,162 @@ def validate_csrf_token():
     if not expected or not secrets.compare_digest(expected, token):
         return False
     return True
+
+
+# ============================================================
+# SSRF 防护
+# ============================================================
+
+# 禁止访问的内网 IP 范围（RFC 1918 及特殊地址）
+PRIVATE_IP_RANGES = [
+    ipaddress.ip_network("127.0.0.0/8"),       # 本地回环
+    ipaddress.ip_network("10.0.0.0/8"),         # A 类私有
+    ipaddress.ip_network("172.16.0.0/12"),      # B 类私有
+    ipaddress.ip_network("192.168.0.0/16"),     # C 类私有
+    ipaddress.ip_network("169.254.0.0/16"),     # 链路本地
+    ipaddress.ip_network("0.0.0.0/8"),          # 零地址
+    ipaddress.ip_network("100.64.0.0/10"),      # CGNAT
+    ipaddress.ip_network("198.18.0.0/15"),      # 基准测试
+    ipaddress.ip_network("::1/128"),             # IPv6 回环
+    ipaddress.ip_network("fc00::/7"),            # IPv6 唯一本地
+    ipaddress.ip_network("fe80::/10"),           # IPv6 链路本地
+]
+
+# 允许访问的域名白名单（可选，空列表表示允许所有公网域名，但禁止内网）
+ALLOWED_DOMAINS = []  # 例：["api.example.com"] 表示只允许此域名
+
+# 允许的 URL Scheme
+ALLOWED_SCHEMES = ("http", "https")
+
+# 最大返回内容大小（字节）
+MAX_RESPONSE_SIZE = 2 * 1024 * 1024  # 2MB
+
+# 请求超时（秒）
+REQUEST_TIMEOUT = 10
+
+
+
+def is_private_ip(ip):
+    """
+    检查 IP 是否为私有/内网地址。
+    支持 IPv4 和 IPv6。
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+        for network in PRIVATE_IP_RANGES:
+            if addr in network:
+                return True
+        return addr.is_private or addr.is_loopback or addr.is_link_local
+    except ValueError:
+        return True  # 解析失败视为危险
+
+
+def resolve_and_validate(url):
+    """
+    SSRF 核心防护：
+    1. 校验 URL scheme
+    2. 解析域名得到 IP
+    3. 校验是否为内网/私有 IP
+    
+    返回: (safe: bool, error_msg: str or None, resolved_ip: str or None)
+    """
+    parsed = urllib.parse.urlparse(url)
+
+    # 1. Scheme 校验
+    if parsed.scheme not in ALLOWED_SCHEMES:
+        return False, f"不支持的协议: {parsed.scheme}，仅允许 HTTP/HTTPS", None
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False, "URL 中缺少主机名", None
+
+    # 2. 域名白名单检查
+    if ALLOWED_DOMAINS:
+        if hostname not in ALLOWED_DOMAINS:
+            return False, f"域名 {hostname} 不在白名单中", None
+
+    try:
+        # 3. DNS 解析：获取所有 IP 地址
+        #    使用 socket.getaddrinfo() 获取 IPv4 和 IPv6 地址
+        addrinfo = socket.getaddrinfo(hostname, None)
+        resolved_ips = set()
+        for info in addrinfo:
+            ip = info[4][0]
+            resolved_ips.add(ip)
+
+        if not resolved_ips:
+            return False, f"无法解析域名: {hostname}", None
+
+        # 4. 校验每个解析到的 IP 是否在内网范围
+        for ip in resolved_ips:
+            if is_private_ip(ip):
+                return False, f"拒绝访问内网地址: {ip}（解析自 {hostname}）", None
+
+        resolved_ip = next(iter(resolved_ips))
+        return True, None, resolved_ip
+
+    except socket.gaierror:
+        return False, f"DNS 解析失败: {hostname}", None
+    except Exception as e:
+        return False, f"地址校验异常: {str(e)}", None
+
+
+def safe_fetch_url(url):
+    """
+    安全的 URL 请求函数，内置 SSRF 防护。
+    1. SSRF 校验（内网/私有 IP 拦截）
+    2. 内容大小限制
+    3. 请求超时
+    4. SSL 验证
+    
+    返回: (success: bool, content_or_error: str, content_type: str or None)
+    """
+    # SSRF 校验
+    safe, error_msg, resolved_ip = resolve_and_validate(url)
+    if not safe:
+        return False, error_msg, None
+
+    # 设置默认 User-Agent
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+
+        # 创建 SSL 上下文（验证证书）
+        ssl_ctx = ssl.create_default_context()
+
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=ssl_ctx) as response:
+            content_type = response.headers.get("Content-Type", "application/octet-stream")
+
+            # 限制读取大小防止内存溢出
+            content = response.read(MAX_RESPONSE_SIZE)
+
+            # 只允许文本内容
+            content_type_lower = content_type.lower()
+            if "text" not in content_type_lower and "json" not in content_type_lower \
+               and "xml" not in content_type_lower and "html" not in content_type_lower \
+               and "javascript" not in content_type_lower and content_type_lower != "application/octet-stream":
+                return False, f"不支持的文件类型: {content_type}", None
+
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                text = content.decode("utf-8", errors="replace")
+
+            return True, text, content_type
+
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP 请求失败: {e.code} {e.reason}", None
+    except urllib.error.URLError as e:
+        return False, f"URL 请求异常: {str(e.reason)}", None
+    except ssl.SSLError as e:
+        return False, f"SSL 证书验证失败: {str(e)}", None
+    except socket.timeout:
+        return False, "请求超时", None
+    except Exception as e:
+        return False, f"请求异常: {str(e)}", None
 
 
 @app.context_processor
@@ -726,6 +888,93 @@ def dynamic_page():
     username = session.get("username")
     user = get_user_info(username) if username else None
     return render_template("index.html", user=user, page_content=page_content)
+
+
+@app.route("/fetch-url", methods=["GET", "POST"])
+@login_required()
+def fetch_url():
+    """
+    安全的 URL 抓取工具 - 内置 SSRF 防护。
+    用户可输入 URL 获取其内容，但严格禁止访问内网地址。
+    """
+    error = None
+    result = None
+    target_url = None
+    resolved_ip = None
+    content_type = None
+
+    if request.method == "POST":
+        target_url = request.form.get("url", "").strip()
+
+        if not target_url:
+            error = "请输入 URL"
+        else:
+            # 1. 补充默认协议
+            if not target_url.startswith(("http://", "https://")):
+                target_url = "https://" + target_url
+
+            # 2. URL 格式校验
+            parsed = urllib.parse.urlparse(target_url)
+            if not parsed.hostname:
+                error = "URL 格式无效"
+            else:
+                # 3. SSRF 前置校验（含 DNS 解析和内网 IP 拦截）
+                safe, err_msg, ip = resolve_and_validate(target_url)
+                if not safe:
+                    error = err_msg
+                else:
+                    resolved_ip = ip
+                    # 4. 安全抓取
+                    success, content, ctype = safe_fetch_url(target_url)
+                    if success:
+                        result = content
+                        content_type = ctype
+                    else:
+                        error = content
+
+    return render_template(
+        "fetch_url.html",
+        error=error,
+        result=result,
+        target_url=target_url,
+        resolved_ip=resolved_ip,
+        content_type=content_type
+    )
+
+
+@app.route("/change-password", methods=["POST"])
+def change_password():
+    """
+    修改密码 - 不需要原密码，不需要 CSRF Token，不需要验证 session
+    任何已登录用户都可以修改任何人的密码
+    """
+    username = request.form.get("username", "").strip()
+    new_password = request.form.get("new_password", "")
+    
+    if not username or not new_password:
+        flash("用户名和密码不能为空")
+        return redirect(url_for("profile"))
+    
+    if len(new_password) < 6:
+        flash("密码长度不能少于 6 个字符")
+        return redirect(url_for("profile", user_id=request.args.get("user_id", "")))
+    
+    password_hash = generate_password_hash(new_password)
+    
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE users SET password = ? WHERE username = ?",
+            (password_hash, username)
+        )
+        if c.rowcount > 0:
+            conn.commit()
+            flash(f"用户 {username} 密码修改成功！")
+        else:
+            flash(f"用户 {username} 不存在")
+    
+    # 重定向回 profile，尽可能带上 user_id 参数
+    return redirect(url_for("profile", user_id=request.form.get("user_id", "")))
 
 
 @app.route("/logout")
